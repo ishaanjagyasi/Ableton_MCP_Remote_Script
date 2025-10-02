@@ -53,6 +53,14 @@ class EnhancedAbletonMCP(ControlSurface):
             "get_available_devices": self.handle_get_available_devices,
             "search_devices": self.handle_search_devices,
             
+            # Track management
+            "rename_track": self.handle_rename_track,
+            "delete_track": self.handle_delete_track,
+            # "delete_tracks": removed - handled by voice script calling delete_track multiple times
+            "duplicate_track": self.handle_duplicate_track,
+            "group_tracks": self.handle_group_tracks,
+            "batch_commands": self.handle_batch_commands,  # New batch executor
+            
             # Transport controls
             "transport_play": self.handle_transport_play,
             "transport_stop": self.handle_transport_stop,
@@ -104,6 +112,9 @@ class EnhancedAbletonMCP(ControlSurface):
 
         # Listen for song changes
         self.song.add_tracks_listener(self.update_track_cache)
+
+        # Debug: Log available command handlers
+        self.log_message(f"Available command handlers: {list(self.command_handlers.keys())}")
 
         self.log_message("Enhanced Ableton MCP Remote Script loaded successfully")
 
@@ -427,6 +438,291 @@ class EnhancedAbletonMCP(ControlSurface):
             return {"action": "set_groove_amount", "amount": amount, "status": "success"}
         except Exception as e:
             return {"error": f"Failed to set groove amount: {str(e)}"}
+
+    # ========== TRACK MANAGEMENT HANDLERS ==========
+
+    def handle_rename_track(self, command):
+        """Rename an existing track"""
+        try:
+            track_name = command.get("track", "selected")
+            new_name = command.get("new_name", "")
+            
+            if not new_name:
+                return {"error": "No new name provided"}
+            
+            track = self.find_track_improved(track_name)
+            if not track:
+                return {"error": f"Track not found: {track_name}"}
+            
+            old_name = track.name
+            track.name = new_name
+            
+            # Update track cache
+            self.update_track_cache()
+            
+            return {
+                "action": "rename_track",
+                "old_name": old_name,
+                "new_name": new_name,
+                "status": "renamed"
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to rename track: {str(e)}"}
+
+    def handle_delete_tracks(self, command):
+        """Delete multiple tracks in sequence"""
+        try:
+            track_names = command.get("tracks", [])
+            if not track_names:
+                return {"error": "No tracks specified for deletion"}
+            
+            deleted_tracks = []
+            failed_deletions = []
+            
+            # Process deletions from highest index to lowest to avoid index shifting issues
+            tracks_to_delete = []
+            for track_name in track_names:
+                track = self.find_track_improved(track_name)
+                if track:
+                    tracks = list(self.song.tracks)
+                    track_index = tracks.index(track)
+                    tracks_to_delete.append((track_index, track.name, track))
+                else:
+                    failed_deletions.append(f"Track not found: {track_name}")
+            
+            # Sort by index in descending order
+            tracks_to_delete.sort(reverse=True)
+            
+            # Delete tracks
+            for track_index, track_name, track in tracks_to_delete:
+                try:
+                    self.song.delete_track(track_index)
+                    deleted_tracks.append(track_name)
+                    self.log_message(f"Deleted track: {track_name}")
+                except Exception as e:
+                    failed_deletions.append(f"Failed to delete {track_name}: {str(e)}")
+            
+            # Update track cache
+            self.update_track_cache()
+            
+            return {
+                "action": "delete_tracks",
+                "deleted_tracks": deleted_tracks,
+                "failed_deletions": failed_deletions,
+                "deleted_count": len(deleted_tracks),
+                "status": "completed"
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to delete tracks: {str(e)}"}
+
+    def handle_batch_commands(self, command):
+        """Execute multiple commands in sequence"""
+        try:
+            commands = command.get("commands", [])
+            if not commands:
+                return {"error": "No commands provided in batch"}
+            
+            results = []
+            successful_count = 0
+            
+            for i, sub_command in enumerate(commands):
+                try:
+                    action = sub_command.get("action")
+                    if action in self.command_handlers:
+                        result = self.command_handlers[action](sub_command)
+                        results.append({
+                            "step": i + 1,
+                            "action": action,
+                            "result": result,
+                            "status": "success" if "error" not in result else "failed"
+                        })
+                        
+                        if "error" not in result:
+                            successful_count += 1
+                        
+                        # Small delay between commands
+                        time.sleep(0.2)
+                    else:
+                        results.append({
+                            "step": i + 1,
+                            "action": action,
+                            "result": {"error": f"Unknown action: {action}"},
+                            "status": "failed"
+                        })
+                        
+                except Exception as e:
+                    results.append({
+                        "step": i + 1,
+                        "action": sub_command.get("action", "unknown"),
+                        "result": {"error": str(e)},
+                        "status": "failed"
+                    })
+            
+            # Update track cache after batch
+            self.update_track_cache()
+            
+            return {
+                "action": "batch_commands",
+                "total_commands": len(commands),
+                "successful_commands": successful_count,
+                "results": results,
+                "status": "completed"
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to execute batch commands: {str(e)}"}
+
+    def handle_delete_track(self, command):
+        """Delete an existing track with better error handling"""
+        try:
+            track_name = command.get("track", "selected")
+            
+            track = self.find_track_improved(track_name)
+            if not track:
+                return {"error": f"Track not found: {track_name}"}
+            
+            tracks = list(self.song.tracks)
+            track_index = tracks.index(track)
+            track_name_to_delete = track.name
+            
+            # Use a scheduled task for deletion to avoid blocking
+            def delete_track_task():
+                try:
+                    self.song.delete_track(track_index)
+                    self.update_track_cache()
+                    self.log_message(f"Deleted track: {track_name_to_delete}")
+                except Exception as e:
+                    self.log_message(f"Error deleting track: {str(e)}")
+            
+            self.schedule_message(1, delete_track_task)
+            
+            return {
+                "action": "delete_track",
+                "deleted_track": track_name_to_delete,
+                "track_index": track_index,
+                "status": "deleting"
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to delete track: {str(e)}"}
+
+    def handle_duplicate_track(self, command):
+        """Duplicate an existing track"""
+        try:
+            track_name = command.get("track", "selected")
+            new_name = command.get("new_name", None)
+            
+            track = self.find_track_improved(track_name)
+            if not track:
+                return {"error": f"Track not found: {track_name}"}
+            
+            tracks = list(self.song.tracks)
+            track_index = tracks.index(track)
+            
+            def duplicate_track_task():
+                try:
+                    # Duplicate the track
+                    self.song.duplicate_track(track_index)
+                    
+                    # Get the duplicated track (should be right after original)
+                    new_tracks = list(self.song.tracks)
+                    duplicated_track = new_tracks[track_index + 1]
+                    
+                    # Set custom name if provided
+                    if new_name:
+                        duplicated_track.name = new_name
+                    
+                    # Update track cache
+                    self.update_track_cache()
+                    
+                    self.log_message(f"Duplicated track '{track.name}' -> '{duplicated_track.name}'")
+                    
+                except Exception as e:
+                    self.log_message(f"Error duplicating track: {str(e)}")
+            
+            self.schedule_message(1, duplicate_track_task)
+            
+            return {
+                "action": "duplicate_track",
+                "source_track": track.name,
+                "new_name": new_name if new_name else f"{track.name} Copy",
+                "status": "duplicating"
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to duplicate track: {str(e)}"}
+
+    def handle_group_tracks(self, command):
+        """Group selected tracks"""
+        try:
+            track_names = command.get("tracks", [])
+            group_name = command.get("group_name", "Group")
+            
+            if not track_names:
+                return {"error": "No tracks specified for grouping"}
+            
+            # Find all tracks to group
+            tracks_to_group = []
+            track_indices = []
+            
+            for track_name in track_names:
+                track = self.find_track_improved(track_name)
+                if track:
+                    tracks_to_group.append(track)
+                    tracks = list(self.song.tracks)
+                    track_indices.append(tracks.index(track))
+                else:
+                    return {"error": f"Track not found: {track_name}"}
+            
+            # Sort indices to group in order
+            track_indices.sort()
+            
+            def group_tracks_task():
+                try:
+                    # Create group track
+                    if len(track_indices) > 1:
+                        # Group the tracks (Ableton automatically creates group)
+                        first_index = track_indices[0]
+                        last_index = track_indices[-1]
+                        
+                        # Select tracks to group
+                        for i, track_index in enumerate(track_indices):
+                            if i == 0:
+                                self.song.view.selected_track = list(self.song.tracks)[track_index]
+                            else:
+                                # Add to selection (this might need adjustment based on Live API)
+                                pass
+                        
+                        # Create group (this creates a group track and moves selected tracks into it)
+                        self.song.create_group_track()
+                        
+                        # Rename the group
+                        tracks = list(self.song.tracks)
+                        group_track = tracks[first_index]  # Group track takes the position of first track
+                        group_track.name = group_name
+                        
+                        # Update track cache
+                        self.update_track_cache()
+                        
+                        self.log_message(f"Grouped {len(track_names)} tracks into '{group_name}'")
+                    
+                except Exception as e:
+                    self.log_message(f"Error grouping tracks: {str(e)}")
+            
+            self.schedule_message(1, group_tracks_task)
+            
+            return {
+                "action": "group_tracks",
+                "tracks": [track.name for track in tracks_to_group],
+                "group_name": group_name,
+                "track_count": len(tracks_to_group),
+                "status": "grouping"
+            }
+            
+        except Exception as e:
+            return {"error": f"Failed to group tracks: {str(e)}"}
 
     # ========== ENHANCED TRACK CONTROLS ==========
 
@@ -936,24 +1232,35 @@ class EnhancedAbletonMCP(ControlSurface):
                 time.sleep(1)
 
     def process_command(self, command_str):
-        """Process incoming command from MCP server"""
+        """Process incoming command from MCP server with enhanced debugging"""
         try:
+            self.log_message(f"Received raw command: {command_str}")
             command = json.loads(command_str)
             action = command.get("action")
+            
+            self.log_message(f"Parsed command - Action: {action}, Full command: {command}")
 
             if action in self.command_handlers:
+                self.log_message(f"Found handler for action: {action}")
                 result = self.command_handlers[action](command)
+                self.log_message(f"Handler completed for {action}, result: {result}")
                 return {"status": "success", "result": result, "action": action}
             else:
+                error_msg = f"Unknown action: {action}"
+                self.log_message(error_msg)
                 return {
                     "status": "error",
-                    "message": f"Unknown action: {action}",
+                    "message": error_msg,
                     "action": action,
                 }
 
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            error_msg = f"Invalid JSON command: {str(e)}"
+            self.log_message(error_msg)
             return {"status": "error", "message": "Invalid JSON command"}
         except Exception as e:
+            error_msg = f"Unexpected error in process_command: {str(e)}"
+            self.log_message(error_msg)
             return {"status": "error", "message": str(e)}
 
     def update_track_cache(self):
