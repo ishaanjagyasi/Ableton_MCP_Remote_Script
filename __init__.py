@@ -118,6 +118,73 @@ class EnhancedAbletonMCP(ControlSurface):
 
         self.log_message("Enhanced Ableton MCP Remote Script loaded successfully")
 
+    def handle_intercepted_multi_track(self, command):
+        """Handle multi-track actions by applying base_action to each track"""
+        try:
+            self.log_message(f"Multi-track handler called with: {command}")
+            
+            track_list = command.get("_track_list", [])
+            base_action = command.get("_base_action", {})
+            
+            if not track_list or not base_action:
+                return {"error": "Missing track list or base action"}
+            
+            self.log_message(f"Processing {len(track_list)} tracks with action: {base_action.get('action')}")
+            
+            results = []
+            errors = []
+            
+            for track_name in track_list:
+                try:
+                    action_copy = base_action.copy()
+                    action_type = base_action.get("action")
+                    
+                    if action_type in ["delete_track", "arm_track", "disarm_track", "duplicate_track", "rename_track"]:
+                        action_copy["track"] = track_name
+                    elif action_type == "add_audio_effect":
+                        action_copy["track"] = track_name
+                    elif action_type == "set_parameter":
+                        action_copy["target"] = track_name
+                    else:
+                        action_copy["track"] = track_name
+                    
+                    self.log_message(f"Executing {action_type} on track: {track_name}")
+                    
+                    if action_type in self.command_handlers:
+                        result = self.command_handlers[action_type](action_copy)
+                        
+                        if "error" in result:
+                            errors.append(f"{track_name}: {result.get('error', 'unknown error')}")
+                            self.log_message(f"Error on {track_name}: {result.get('error')}")
+                        else:
+                            results.append(f"{track_name}: success")
+                            self.log_message(f"Success on {track_name}")
+                    else:
+                        errors.append(f"{track_name}: Unknown action {action_type}")
+                        
+                except Exception as e:
+                    error_msg = f"{track_name}: {str(e)}"
+                    errors.append(error_msg)
+                    self.log_message(f"Exception processing {track_name}: {str(e)}")
+            
+            self.update_track_cache()
+            
+            return {
+                "action": "intercepted_multi_track",
+                "tracks_processed": len(track_list),
+                "successful": len(results),
+                "failed": len(errors),
+                "results": results,
+                "errors": errors,
+                "status": "completed"
+            }
+            
+        except Exception as e:
+            error_msg = f"Multi-track action failed: {str(e)}"
+            self.log_message(error_msg)
+            return {"error": error_msg}
+
+
     def disconnect(self):
         """Clean shutdown"""
         self.is_running = False
